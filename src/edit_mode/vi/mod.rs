@@ -183,7 +183,7 @@ impl EditMode for Vi {
                             }
                         })
                 }
-                (_, KeyModifiers::NONE, KeyCode::Esc, _, _) => exit_insert_mode(self),
+                (_, KeyModifiers::NONE, KeyCode::Esc, _, _) => exit_insert_mode(self, ViMode::Normal),
                 (_, KeyModifiers::NONE, KeyCode::Enter, _, _) => {
                     self.mode = ViMode::Insert;
                     ReedlineEvent::Enter
