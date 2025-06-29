@@ -66,10 +66,10 @@ impl Vi {
     }
 }
 
-fn exit_insert_mode(editor: &mut Vi) -> ReedlineEvent {
+fn exit_insert_mode(editor: &mut Vi, new_mode: ViMode) -> ReedlineEvent {
     editor.most_recent_keycode = KeyCode::Null;
     editor.cache.clear();
-    editor.mode = ViMode::Normal;
+    editor.mode = new_mode;
     ReedlineEvent::Multiple(vec![ReedlineEvent::Esc, ReedlineEvent::Repaint])
 }
 
@@ -88,7 +88,10 @@ impl EditMode for Vi {
                 (ViMode::Insert, KeyModifiers::NONE, code, (e1, e2), mr)
                     if code == e2 && mr == e1 =>
                 {
-                    exit_insert_mode(self)
+                    exit_insert_mode(self, ViMode::Normal)
+                }
+                (ViMode::Normal, KeyModifiers::NONE, KeyCode::Char('v'), _, _) => {
+                    exit_insert_mode(self, ViMode::Visual)
                 }
                 (ViMode::Insert, KeyModifiers::NONE, code, (e1, _), _) if code == e1 => {
                     self.most_recent_keycode = code;
@@ -106,11 +109,6 @@ impl EditMode for Vi {
                         ReedlineEvent::Edit(vec![EditCommand::InsertChar(e1)]),
                         ReedlineEvent::Edit(vec![EditCommand::InsertChar(code)]),
                     ])
-                }
-                (ViMode::Normal, KeyModifiers::NONE, KeyCode::Char('v'), _, _) => {
-                    self.cache.clear();
-                    self.mode = ViMode::Visual;
-                    ReedlineEvent::Multiple(vec![ReedlineEvent::Esc, ReedlineEvent::Repaint])
                 }
 
                 (ViMode::Normal, modifier, KeyCode::Char(c), _, _) => {
