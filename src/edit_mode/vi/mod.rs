@@ -111,7 +111,7 @@ impl EditMode for Vi {
                     ])
                 }
 
-                (ViMode::Normal, modifier, KeyCode::Char(c), _, _) => {
+                (ViMode::Normal | ViMode::Visual, modifier, KeyCode::Char(c), _, _) => {
                     let c = c.to_ascii_lowercase();
 
                     if let Some(event) = self
