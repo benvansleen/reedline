@@ -27,6 +27,7 @@ use {
             FileBackedHistory, History, HistoryCursor, HistoryItem, HistoryItemId,
             HistoryNavigationQuery, HistorySessionId, SearchDirection, SearchQuery,
         },
+        menu_functions::replace_in_buffer,
         painting::{Painter, PainterSuspendedState, PromptLines},
         prompt::{PromptEditMode, PromptHistorySearchStatus, PromptViMode},
         result::{ReedlineError, ReedlineErrorVariants},
@@ -678,6 +679,36 @@ impl Reedline {
         result
     }
 
+    fn with_suspended_terminal<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> (T, Option<u16>),
+    ) -> io::Result<T> {
+        let painter_state = self.painter.state_before_suspension();
+        self.bracketed_paste.exit();
+        self.kitty_protocol.exit();
+        terminal::disable_raw_mode()?;
+
+        let (result, clear_height) = f(self);
+
+        let reuse_prompt = self
+            .painter
+            .clear_after_external_picker(&painter_state, clear_height)?;
+
+        let raw_mode_result = terminal::enable_raw_mode();
+        self.bracketed_paste.enter();
+        self.kitty_protocol.enter();
+        raw_mode_result?;
+        if reuse_prompt {
+            self.painter.restore_prompt_position(&painter_state)?;
+            self.painter
+                .initialize_prompt_position(Some(&painter_state))?;
+        } else {
+            self.painter.initialize_prompt_position(None)?;
+        }
+
+        Ok(result)
+    }
+
     /// Returns the current insertion point of the input buffer.
     pub fn current_insertion_point(&self) -> usize {
         self.editor.insertion_point()
@@ -1017,7 +1048,29 @@ impl Reedline {
         match event {
             ReedlineEvent::Menu(name) => {
                 if self.active_menu().is_none() {
-                    if let Some(menu) = self.menus.iter_mut().find(|menu| menu.name() == name) {
+                    if let Some(menu_index) = self.menus.iter().position(|menu| menu.name() == name)
+                    {
+                        if self.menus[menu_index].uses_external_picker() {
+                            self.menus[menu_index]
+                                .menu_event(MenuEvent::Activate(self.quick_completions));
+                            let selection = self.with_suspended_terminal(|editor| {
+                                let selection = editor.menus[menu_index].external_pick(
+                                    &mut editor.editor,
+                                    editor.completer.as_mut(),
+                                    editor.history.as_ref(),
+                                );
+                                let clear_height =
+                                    editor.menus[menu_index].take_external_clear_height();
+                                (selection, clear_height)
+                            })?;
+                            self.menus[menu_index].menu_event(MenuEvent::Deactivate);
+                            if let Some(suggestion) = selection {
+                                replace_in_buffer(Some(suggestion), &mut self.editor);
+                            }
+                            return Ok(EventStatus::Handled);
+                        }
+
+                        let menu = &mut self.menus[menu_index];
                         menu.menu_event(MenuEvent::Activate(self.quick_completions));
 
                         if self.quick_completions && menu.can_quick_complete() {

@@ -53,6 +53,26 @@ pub type W = std::io::BufWriter<std::io::Stderr>;
 #[derive(Debug, PartialEq, Eq)]
 pub struct PainterSuspendedState {
     previous_prompt_rows_range: RangeInclusive<u16>,
+    cursor_position: Option<(u16, u16)>,
+    prompt_height: u16,
+}
+
+impl PainterSuspendedState {
+    pub(crate) fn prompt_start_row(&self) -> u16 {
+        *self.previous_prompt_rows_range.start()
+    }
+
+    pub(crate) fn prompt_end_row(&self) -> u16 {
+        *self.previous_prompt_rows_range.end()
+    }
+
+    pub(crate) fn cursor_position(&self) -> Option<(u16, u16)> {
+        self.cursor_position
+    }
+
+    pub(crate) fn prompt_height(&self) -> u16 {
+        self.prompt_height
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -148,7 +168,65 @@ impl Painter {
         let final_row = start_row + self.last_required_lines;
         PainterSuspendedState {
             previous_prompt_rows_range: start_row..=final_row,
+            cursor_position: cursor::position().ok(),
+            prompt_height: self.prompt_height,
         }
+    }
+
+    /// Restores the cursor to the previous prompt start row after a suspend.
+    pub(crate) fn restore_prompt_position(
+        &mut self,
+        suspended_state: &PainterSuspendedState,
+    ) -> Result<()> {
+        let start_row = *suspended_state.previous_prompt_rows_range.start();
+        self.stdout.queue(MoveTo(0, start_row))?.flush()
+    }
+
+    pub(crate) fn clear_from_row(&mut self, row: u16) -> Result<()> {
+        self.stdout
+            .queue(MoveTo(0, row))?
+            .queue(Clear(ClearType::FromCursorDown))?
+            .flush()
+    }
+
+    pub(crate) fn clear_after_external_picker(
+        &mut self,
+        suspended_state: &PainterSuspendedState,
+        clear_height: Option<u16>,
+    ) -> Result<bool> {
+        let Some(clear_height) = clear_height else {
+            return Ok(true);
+        };
+
+        if clear_height == 0 {
+            return Ok(true);
+        }
+
+        let (_, screen_height) = terminal::size()?;
+        let clear_height = clear_height.min(screen_height);
+        if clear_height == 0 {
+            return Ok(true);
+        }
+
+        let skim_top = screen_height.saturating_sub(clear_height);
+        let prompt_start = suspended_state.prompt_start_row();
+        let prompt_end = suspended_state.prompt_end_row();
+        let reuse_prompt = prompt_end < skim_top;
+
+        let cursor_position = suspended_state.cursor_position();
+        let cursor_row = cursor_position.map(|(_, row)| row).unwrap_or(prompt_end);
+        let cursor_col = cursor_position.map(|(col, _)| col).unwrap_or(0);
+        let cursor_row_for_skim = cursor_row.saturating_add(u16::from(cursor_col > 0));
+        let scroll_amount = cursor_row_for_skim
+            .saturating_add(clear_height)
+            .saturating_sub(screen_height);
+        let mut clear_start = prompt_start.saturating_sub(scroll_amount);
+        if !reuse_prompt && suspended_state.prompt_height() > 1 {
+            clear_start = clear_start.saturating_sub(1);
+        }
+
+        self.clear_from_row(clear_start)?;
+        Ok(reuse_prompt)
     }
 
     /// Sets the prompt origin position and screen size for a new line editor
@@ -728,6 +806,8 @@ mod tests {
     fn test_select_existing_prompt() {
         let state = PainterSuspendedState {
             previous_prompt_rows_range: 11..=13,
+            cursor_position: None,
+            prompt_height: 1,
         };
         assert_eq!(
             select_prompt_row(Some(&state), (0, 12)),

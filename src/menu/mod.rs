@@ -3,6 +3,8 @@ mod description_menu;
 mod ide_menu;
 mod list_menu;
 pub mod menu_functions;
+#[cfg(feature = "skim")]
+mod skim_menu;
 
 use crate::core_editor::Editor;
 use crate::History;
@@ -14,6 +16,8 @@ pub use ide_menu::DescriptionMode;
 pub use ide_menu::IdeMenu;
 pub use list_menu::ListMenu;
 use nu_ansi_term::{Color, Style};
+#[cfg(feature = "skim")]
+pub use skim_menu::SkimMenu;
 
 /// Struct to store the menu style
 pub struct MenuTextStyle {
@@ -97,6 +101,25 @@ pub trait Menu: Send {
 
     /// Selects what type of event happened with the menu
     fn menu_event(&mut self, event: MenuEvent);
+
+    /// Whether this menu uses an external picker UI
+    fn uses_external_picker(&self) -> bool {
+        false
+    }
+
+    /// Optional external picker selection, if supported
+    fn external_pick(
+        &mut self,
+        _editor: &mut Editor,
+        _completer: &mut dyn Completer,
+    ) -> Option<Suggestion> {
+        None
+    }
+
+    /// Optional external picker clear height, if supported
+    fn take_external_clear_height(&mut self) -> Option<u16> {
+        None
+    }
 
     /// A menu may not be allowed to quick complete because it needs to stay
     /// active even with one element
@@ -304,6 +327,28 @@ impl ReedlineMenu {
         }
     }
 
+    fn with_completer<T>(
+        &mut self,
+        completer: &mut dyn Completer,
+        history: Option<&dyn History>,
+        f: impl FnOnce(&mut dyn Menu, &mut dyn Completer) -> T,
+    ) -> T {
+        match self {
+            Self::EngineCompleter(menu) => f(menu.as_mut(), completer),
+            Self::HistoryMenu(menu) => match history {
+                Some(history) => {
+                    let mut history_completer = HistoryCompleter::new(history);
+                    f(menu.as_mut(), &mut history_completer)
+                }
+                None => f(menu.as_mut(), completer),
+            },
+            Self::WithCompleter {
+                menu,
+                completer: own_completer,
+            } => f(menu.as_mut(), own_completer.as_mut()),
+        }
+    }
+
     pub(crate) fn can_partially_complete(
         &mut self,
         values_updated: bool,
@@ -311,19 +356,28 @@ impl ReedlineMenu {
         completer: &mut dyn Completer,
         history: &dyn History,
     ) -> bool {
-        match self {
-            Self::EngineCompleter(menu) => {
-                menu.can_partially_complete(values_updated, editor, completer)
-            }
-            Self::HistoryMenu(menu) => {
-                let mut history_completer = HistoryCompleter::new(history);
-                menu.can_partially_complete(values_updated, editor, &mut history_completer)
-            }
-            Self::WithCompleter {
-                menu,
-                completer: own_completer,
-            } => menu.can_partially_complete(values_updated, editor, own_completer.as_mut()),
-        }
+        self.with_completer(completer, Some(history), |menu, completer| {
+            menu.can_partially_complete(values_updated, editor, completer)
+        })
+    }
+
+    pub(crate) fn uses_external_picker(&self) -> bool {
+        self.as_ref().uses_external_picker()
+    }
+
+    pub(crate) fn external_pick(
+        &mut self,
+        editor: &mut Editor,
+        completer: &mut dyn Completer,
+        history: &dyn History,
+    ) -> Option<Suggestion> {
+        self.with_completer(completer, Some(history), |menu, completer| {
+            menu.external_pick(editor, completer)
+        })
+    }
+
+    pub(crate) fn take_external_clear_height(&mut self) -> Option<u16> {
+        self.as_mut().take_external_clear_height()
     }
 
     pub(crate) fn update_values(
@@ -332,19 +386,9 @@ impl ReedlineMenu {
         completer: &mut dyn Completer,
         history: &dyn History,
     ) {
-        match self {
-            Self::EngineCompleter(menu) => menu.update_values(editor, completer),
-            Self::HistoryMenu(menu) => {
-                let mut history_completer = HistoryCompleter::new(history);
-                menu.update_values(editor, &mut history_completer);
-            }
-            Self::WithCompleter {
-                menu,
-                completer: own_completer,
-            } => {
-                menu.update_values(editor, own_completer.as_mut());
-            }
-        }
+        self.with_completer(completer, Some(history), |menu, completer| {
+            menu.update_values(editor, completer);
+        });
     }
 
     pub(crate) fn update_working_details(
@@ -354,21 +398,9 @@ impl ReedlineMenu {
         history: &dyn History,
         painter: &Painter,
     ) {
-        match self {
-            Self::EngineCompleter(menu) => {
-                menu.update_working_details(editor, completer, painter);
-            }
-            Self::HistoryMenu(menu) => {
-                let mut history_completer = HistoryCompleter::new(history);
-                menu.update_working_details(editor, &mut history_completer, painter);
-            }
-            Self::WithCompleter {
-                menu,
-                completer: own_completer,
-            } => {
-                menu.update_working_details(editor, own_completer.as_mut(), painter);
-            }
-        }
+        self.with_completer(completer, Some(history), |menu, completer| {
+            menu.update_working_details(editor, completer, painter);
+        });
     }
 }
 
@@ -393,6 +425,24 @@ impl Menu for ReedlineMenu {
         self.as_mut().menu_event(event);
     }
 
+    fn uses_external_picker(&self) -> bool {
+        self.as_ref().uses_external_picker()
+    }
+
+    fn external_pick(
+        &mut self,
+        editor: &mut Editor,
+        completer: &mut dyn Completer,
+    ) -> Option<Suggestion> {
+        self.with_completer(completer, None, |menu, completer| {
+            menu.external_pick(editor, completer)
+        })
+    }
+
+    fn take_external_clear_height(&mut self) -> Option<u16> {
+        self.as_mut().take_external_clear_height()
+    }
+
     fn can_quick_complete(&self) -> bool {
         self.as_ref().can_quick_complete()
     }
@@ -403,29 +453,15 @@ impl Menu for ReedlineMenu {
         editor: &mut Editor,
         completer: &mut dyn Completer,
     ) -> bool {
-        match self {
-            Self::EngineCompleter(menu) | Self::HistoryMenu(menu) => {
-                menu.can_partially_complete(values_updated, editor, completer)
-            }
-            Self::WithCompleter {
-                menu,
-                completer: own_completer,
-            } => menu.can_partially_complete(values_updated, editor, own_completer.as_mut()),
-        }
+        self.with_completer(completer, None, |menu, completer| {
+            menu.can_partially_complete(values_updated, editor, completer)
+        })
     }
 
     fn update_values(&mut self, editor: &mut Editor, completer: &mut dyn Completer) {
-        match self {
-            Self::EngineCompleter(menu) | Self::HistoryMenu(menu) => {
-                menu.update_values(editor, completer);
-            }
-            Self::WithCompleter {
-                menu,
-                completer: own_completer,
-            } => {
-                menu.update_values(editor, own_completer.as_mut());
-            }
-        }
+        self.with_completer(completer, None, |menu, completer| {
+            menu.update_values(editor, completer);
+        });
     }
 
     fn update_working_details(
@@ -434,17 +470,9 @@ impl Menu for ReedlineMenu {
         completer: &mut dyn Completer,
         painter: &Painter,
     ) {
-        match self {
-            Self::EngineCompleter(menu) | Self::HistoryMenu(menu) => {
-                menu.update_working_details(editor, completer, painter);
-            }
-            Self::WithCompleter {
-                menu,
-                completer: own_completer,
-            } => {
-                menu.update_working_details(editor, own_completer.as_mut(), painter);
-            }
-        }
+        self.with_completer(completer, None, |menu, completer| {
+            menu.update_working_details(editor, completer, painter);
+        });
     }
 
     fn replace_in_buffer(&self, editor: &mut Editor) {
